@@ -1,0 +1,12 @@
+# Basic requirements (no PDF generation)
+streamlit
+pandas
+numpy
+plotly
+openpyxl
+geopandas
+shapely
+rasterio
+affine
+matplotlib
+pykrige

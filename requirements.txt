@@ -1,0 +1,13 @@
+streamlit>=1.25.0
+pandas>=1.3.0
+numpy>=1.20.0
+plotly>=5.0.0
+openpyxl>=3.0.0
+reportlab>=3.6.0
+Pillow>=8.0.0
+geopandas>=0.12.0
+shapely>=1.8.0
+rasterio>=1.3.0
+affine>=2.3.0
+matplotlib>=3.5.0
+pykrige>=1.6.0
