@@ -4,13 +4,15 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy import stats
 import io
 from pathlib import Path
 import re
 from datetime import datetime
 import base64
 import geopandas as gpd
-from shapely.geometry import mapping
+from shapely.geometry import mapping, Point, Polygon
+from shapely import wkb, wkt
 from rasterio.features import geometry_mask
 from affine import Affine
 import matplotlib.pyplot as plt
@@ -265,7 +267,7 @@ st.set_page_config(
 
 # Initialize language in session state
 if 'language' not in st.session_state:
-    st.session_state.language = 'pt'
+    st.session_state.language = 'en'
 
 def t(key):
     """Translation function"""
@@ -485,8 +487,23 @@ def create_classification_summary(df):
         "classification_percentages": {k: (v/total)*100 for k, v in summary.items()}
     }
 
-def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâmetro", value_col="Resultado numérico"):
-    """Create chart for specific parameter with optional grouping"""
+def create_kde_curve(data, x_range, bandwidth=None):
+    """Create KDE curve data"""
+    if len(data) < 2:
+        return x_range, np.zeros_like(x_range)
+    
+    try:
+        kde = stats.gaussian_kde(data, bw_method=bandwidth)
+        density = kde(x_range)
+        return x_range, density
+    except:
+        # Fallback to simple histogram if KDE fails
+        hist, bin_edges = np.histogram(data, bins=50, density=True)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        return bin_centers, hist
+
+def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâmetro", value_col="Resultado numérico", separate_by_classification=False):
+    """Create KDE density curves for specific parameter with optional grouping"""
     if param_col not in df.columns:
         return None
     
@@ -499,6 +516,34 @@ def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâm
     
     # Translate parameter name for display
     display_param_name = translate_parameter_for_display(param_name)
+    
+    # Get overall data range for x-axis
+    all_values = param_data[value_col].dropna()
+    if all_values.empty:
+        return None
+    
+    x_min, x_max = all_values.min(), all_values.max()
+    x_range = np.linspace(x_min, x_max, 200)
+    
+    # Handle subplot creation if separating by classification
+    if separate_by_classification:
+        classifications = param_data["Classificação_Display"].unique()
+        n_classifications = len(classifications)
+        
+        if n_classifications == 0:
+            return None
+        
+        # Create subplots
+        from plotly.subplots import make_subplots
+        fig = make_subplots(
+            rows=1, cols=n_classifications,
+            subplot_titles=classifications,
+            shared_yaxes=True,
+            horizontal_spacing=0.05
+        )
+    else:
+        # Create single figure
+        fig = go.Figure()
     
     # Handle multiple grouping columns
     if group_by_cols:
@@ -517,37 +562,381 @@ def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâm
                 )
                 combined_group_col = 'Combined_Group'
             
-            # Create grouped histogram
-            fig = px.histogram(
-                param_data, 
-                x=value_col, 
-                color=combined_group_col,
-                facet_col="Classificação_Display",
+            # Create plots for each classification
+            classifications = param_data["Classificação_Display"].unique()
+            
+            for i, classification in enumerate(classifications):
+                classification_data = param_data[param_data["Classificação_Display"] == classification]
+                groups = classification_data[combined_group_col].unique()
+                
+                for group in groups:
+                    group_data = classification_data[classification_data[combined_group_col] == group]
+                    values = group_data[value_col].dropna()
+                    
+                    if len(values) > 1:
+                        x_vals, density = create_kde_curve(values, x_range)
+                        
+                        if separate_by_classification:
+                            # Add to specific subplot
+                            fig.add_trace(go.Scatter(
+                                x=x_vals,
+                                y=density,
+                                mode='lines',
+                                fill='tozeroy',
+                                name=f"{group}",
+                                opacity=0.7,
+                                line=dict(width=2),
+                                showlegend=(i == 0)  # Only show legend for first subplot
+                            ), row=1, col=i+1)
+                        else:
+                            # Add to single plot
+                            fig.add_trace(go.Scatter(
+                                x=x_vals,
+                                y=density,
+                                mode='lines',
+                                fill='tozeroy',
+                                name=f"{classification} - {group}",
+                                opacity=0.7,
+                                line=dict(width=2)
+                            ))
+            
+            if separate_by_classification:
+                fig.update_layout(
                 title=f"{t('distribution')} - {display_param_name} por {' + '.join(valid_group_cols)}",
-                labels={value_col: "Valor", "count": "Frequência"},
-                barmode="overlay"
-            )
-            fig.update_traces(opacity=0.7)
+                    height=400
+                )
+                fig.update_xaxes(title_text="Valor")
+                fig.update_yaxes(title_text="Density")
+            else:
+                fig.update_layout(
+                    title=f"{t('distribution')} - {display_param_name} por {' + '.join(valid_group_cols)}",
+                    xaxis_title="Valor",
+                    yaxis_title="Density",
+                    height=400
+                )
         else:
             # Fallback to classification-only grouping
-            fig = px.histogram(
-                param_data, 
-                x=value_col, 
-                color="Classificação_Display",
-                title=f"{t('distribution')} - {display_param_name}",
-                labels={value_col: "Valor", "count": "Frequência"}
-            )
+            classifications = param_data["Classificação_Display"].unique()
+            
+            for i, classification in enumerate(classifications):
+                classification_data = param_data[param_data["Classificação_Display"] == classification]
+                values = classification_data[value_col].dropna()
+                
+                if len(values) > 1:
+                    x_vals, density = create_kde_curve(values, x_range)
+                    
+                    if separate_by_classification:
+                        # Add to specific subplot
+                        fig.add_trace(go.Scatter(
+                            x=x_vals,
+                            y=density,
+                            mode='lines',
+                            fill='tozeroy',
+                            name=classification,
+                            opacity=0.7,
+                            line=dict(width=2),
+                            showlegend=False  # No legend needed for single classification per subplot
+                        ), row=1, col=i+1)
+                else:
+                        # Add to single plot
+                        fig.add_trace(go.Scatter(
+                            x=x_vals,
+                            y=density,
+                            mode='lines',
+                            fill='tozeroy',
+                            name=classification,
+                            opacity=0.7,
+                            line=dict(width=2)
+                        ))
+            
+            if separate_by_classification:
+                fig.update_layout(
+                    title=f"{t('distribution')} - {display_param_name}",
+                    height=400
+                )
+                fig.update_xaxes(title_text="Valor")
+                fig.update_yaxes(title_text="Density")
+            else:
+                fig.update_layout(
+                    title=f"{t('distribution')} - {display_param_name}",
+                    xaxis_title="Valor",
+                    yaxis_title="Density",
+                    height=400
+                )
     else:
-        # Default histogram by classification
-        fig = px.histogram(
-            param_data, 
-            x=value_col, 
-            color="Classificação_Display",
-            title=f"{t('distribution')} - {display_param_name}",
-            labels={value_col: "Valor", "count": "Frequência"}
-        )
+        # No valid group columns, create default KDE plot by classification
+        classifications = param_data["Classificação_Display"].unique()
+        
+        for i, classification in enumerate(classifications):
+            classification_data = param_data[param_data["Classificação_Display"] == classification]
+            values = classification_data[value_col].dropna()
+            
+            if len(values) > 1:
+                x_vals, density = create_kde_curve(values, x_range)
+                
+                if separate_by_classification:
+                        # Add to specific subplot
+                        fig.add_trace(go.Scatter(
+                            x=x_vals,
+                            y=density,
+                            mode='lines',
+                            fill='tozeroy',
+                            name=classification,
+                            opacity=0.7,
+                            line=dict(width=2),
+                            showlegend=False  # No legend needed for single classification per subplot
+                        ), row=1, col=i+1)
+                else:
+                        # Add to single plot
+                        fig.add_trace(go.Scatter(
+                            x=x_vals,
+                            y=density,
+                            mode='lines',
+                            fill='tozeroy',
+                            name=classification,
+                            opacity=0.7,
+                            line=dict(width=2)
+                        ))
+        
+        if separate_by_classification:
+            fig.update_layout(
+                title=f"{t('distribution')} - {display_param_name}",
+                height=400
+            )
+            fig.update_xaxes(title_text="Valor")
+            fig.update_yaxes(title_text="Density")
+        else:
+            fig.update_layout(
+                title=f"{t('distribution')} - {display_param_name}",
+                xaxis_title="Valor",
+                yaxis_title="Density",
+                height=400
+            )
     
-    fig.update_layout(height=400)
+    return fig
+
+def create_spatial_plot(gdf, param_name, polygon_gdf=None, purpose_filter=None, depth_filter=None, 
+                       param_col="Parâmetro", value_col="Resultado numérico", 
+                       purpose_col="sampling_plan_purpose", depth_col="depth_range_bottom_m",
+                       cmap="viridis", point_size=100):
+    """Create spatial plot for a specific parameter with optional filters"""
+    if param_col not in gdf.columns or value_col not in gdf.columns:
+        return None
+    
+    # Filter data for the parameter
+    param_data = gdf[gdf[param_col] == param_name].copy()
+    if param_data.empty:
+        return None
+    
+    # Apply filters
+    if purpose_filter and purpose_filter != "All" and purpose_col in param_data.columns:
+        param_data = param_data[param_data[purpose_col] == purpose_filter]
+    
+    if depth_filter and depth_filter != "All" and depth_col in param_data.columns:
+        param_data = param_data[param_data[depth_col] == depth_filter]
+    
+    if param_data.empty:
+        return None
+    
+    # Convert numeric values
+    param_data[value_col] = pd.to_numeric(param_data[value_col], errors='coerce')
+    param_data = param_data.dropna(subset=[value_col])
+    
+    if param_data.empty:
+        return None
+    
+    # Create figure
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    
+    # Get value range for consistent coloring
+    vmin = param_data[value_col].min()
+    vmax = param_data[value_col].max()
+    
+    # Handle case where all values are the same
+    if vmin == vmax:
+        vmin -= 0.01
+        vmax += 0.01
+    
+    # Plot polygon boundaries if available
+    if polygon_gdf is not None and not polygon_gdf.empty:
+        # Ensure same CRS
+        if polygon_gdf.crs != param_data.crs:
+            polygon_gdf = polygon_gdf.to_crs(param_data.crs)
+        
+        # Plot boundaries
+        polygon_gdf.boundary.plot(ax=ax, color="black", linewidth=2)
+        
+        # Add plot type labels if available
+        if "plot_type" in polygon_gdf.columns:
+            for _, row in polygon_gdf.iterrows():
+                if row.geometry is not None and not row.geometry.is_empty:
+                    centroid = row.geometry.centroid
+                    label = str(row["plot_type"])[0].upper()
+                    ax.text(
+                        centroid.x, centroid.y, label,
+                        ha="center", va="center",
+                        fontsize=14, fontweight="bold", color="black",
+                        bbox=dict(facecolor="white", alpha=0.7, boxstyle="circle,pad=0.3")
+                    )
+    
+    # Plot points
+    scatter = param_data.plot(
+        ax=ax,
+        column=value_col,
+        cmap=cmap,
+        markersize=point_size,
+        alpha=0.8,
+        vmin=vmin,
+        vmax=vmax,
+        legend=False,
+        edgecolor="k",
+        linewidth=0.5
+    )
+    
+    # Set equal aspect ratio and labels
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Longitude", fontsize=12)
+    ax.set_ylabel("Latitude", fontsize=12)
+    
+    # Title
+    display_param_name = translate_parameter_for_display(param_name)
+    title_parts = [display_param_name]
+    
+    if purpose_filter and purpose_filter != "All":
+        title_parts.append(f"Purpose: {purpose_filter}")
+    
+    if depth_filter and depth_filter != "All":
+        title_parts.append(f"Depth: {depth_filter}")
+    
+    title = " - ".join(title_parts)
+    ax.set_title(title, fontsize=14, fontweight="bold")
+    
+    # Add colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm._A = []
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.8)
+    cbar.set_label(value_col, fontsize=12)
+    
+    plt.tight_layout()
+    return fig
+
+def create_spatial_comparison_plot(gdf, param_name, polygon_gdf=None, purposes=("PRE_APPLICATION", "CREDIT_SAMPLING_1"),
+                                 param_col="Parâmetro", value_col="Resultado numérico", 
+                                 purpose_col="sampling_plan_purpose", depth_col="depth_range_bottom_m",
+                                 cmap="viridis", point_size=100):
+    """Create spatial comparison plot with two panels for different purposes"""
+    if param_col not in gdf.columns or value_col not in gdf.columns:
+        return None
+    
+    # Filter data for the parameter
+    param_data = gdf[gdf[param_col] == param_name].copy()
+    if param_data.empty:
+        return None
+    
+    # Convert numeric values
+    param_data[value_col] = pd.to_numeric(param_data[value_col], errors='coerce')
+    param_data = param_data.dropna(subset=[value_col])
+    
+    if param_data.empty:
+        return None
+    
+    # Get global value range for consistent coloring across panels
+    vmin = param_data[value_col].min()
+    vmax = param_data[value_col].max()
+    
+    if vmin == vmax:
+        vmin -= 0.01
+        vmax += 0.01
+    
+    # Create figure with two subplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    for i, purpose in enumerate(purposes):
+        ax = axes[i]
+        
+        # Filter data for this purpose
+        purpose_data = param_data[param_data[purpose_col] == purpose] if purpose_col in param_data.columns else param_data
+        
+        # Plot polygon boundaries if available
+        if polygon_gdf is not None and not polygon_gdf.empty:
+            # Ensure same CRS
+            if polygon_gdf.crs != param_data.crs:
+                polygon_gdf = polygon_gdf.to_crs(param_data.crs)
+            
+            # Plot boundaries
+            polygon_gdf.boundary.plot(ax=ax, color="black", linewidth=2)
+            
+            # Add plot type labels if available
+            if "plot_type" in polygon_gdf.columns:
+                for _, row in polygon_gdf.iterrows():
+                    if row.geometry is not None and not row.geometry.is_empty:
+                        centroid = row.geometry.centroid
+                        label = str(row["plot_type"])[0].upper()
+                        ax.text(
+                            centroid.x, centroid.y, label,
+                            ha="center", va="center",
+                            fontsize=12, fontweight="bold", color="black",
+                            bbox=dict(facecolor="white", alpha=0.7, boxstyle="circle,pad=0.2")
+                        )
+        
+        # Plot points for this purpose
+        if not purpose_data.empty:
+            purpose_data.plot(
+                ax=ax,
+                column=value_col,
+                cmap=cmap,
+                markersize=point_size,
+                alpha=0.8,
+                vmin=vmin,
+                vmax=vmax,
+                legend=False,
+                edgecolor="k",
+                linewidth=0.5
+            )
+            ax.set_title(purpose, fontsize=14, fontweight="bold")
+        else:
+            ax.set_title(f"{purpose} (No Data)", fontsize=14, fontweight="bold")
+        
+        # Set equal aspect ratio and labels
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("Longitude", fontsize=10)
+        ax.set_ylabel("Latitude", fontsize=10)
+    
+    # Synchronize axis limits
+    if polygon_gdf is not None and not polygon_gdf.empty:
+        # Use polygon bounds
+        if polygon_gdf.crs != param_data.crs:
+            polygon_gdf = polygon_gdf.to_crs(param_data.crs)
+        xmin, ymin, xmax, ymax = polygon_gdf.total_bounds
+        pad_x = (xmax - xmin) * 0.02
+        pad_y = (ymax - ymin) * 0.02
+        xmin, xmax = xmin - pad_x, xmax + pad_x
+        ymin, ymax = ymin - pad_y, ymax + pad_y
+    else:
+        # Use data bounds
+        xmin, ymin, xmax, ymax = param_data.total_bounds
+        pad_x = (xmax - xmin) * 0.02
+        pad_y = (ymax - ymin) * 0.02
+        xmin, xmax = xmin - pad_x, xmax + pad_x
+        ymin, ymax = ymin - pad_y, ymax + pad_y
+    
+    for ax in axes:
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+    
+    # Main title
+    display_param_name = translate_parameter_for_display(param_name)
+    fig.suptitle(f"Spatial Comparison - {display_param_name}", fontsize=16, fontweight="bold")
+    
+    # Add colorbar
+    plt.subplots_adjust(right=0.85, top=0.9)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+    sm._A = []
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.02, 0.7])
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label(value_col, fontsize=12)
+    
+    plt.tight_layout()
     return fig
 
 def create_box_plot(df, param_name, group_by_cols, param_col="Parâmetro", value_col="Resultado numérico"):
@@ -1090,6 +1479,87 @@ def generate_docx_report(df, summary_stats, charts_data, project_name="Soil Anal
                 pass
     
     return doc_buffer.getvalue()
+
+def detect_geometry_columns(df):
+    """Detect potential geometry columns in the dataframe"""
+    geometry_columns = []
+    
+    for col in df.columns:
+        col_lower = col.lower()
+        # Check for common geometry column names
+        if any(keyword in col_lower for keyword in ['geometry', 'geom', 'shape', 'wkb', 'wkt', 'coordinates', 'coord']):
+            geometry_columns.append(col)
+        else:
+            # Check if column contains WKB or WKT data
+            sample_values = df[col].dropna().head(10)
+            if len(sample_values) > 0:
+                # Check if values look like WKB (hex strings or binary)
+                sample_str = str(sample_values.iloc[0])
+                if (len(sample_str) > 20 and 
+                    (all(c in '0123456789ABCDEFabcdef' for c in sample_str.replace(' ', '')) or
+                     isinstance(sample_values.iloc[0], bytes))):
+                    geometry_columns.append(col)
+                # Check if values look like WKT
+                elif any(wkt_keyword in sample_str.upper() for wkt_keyword in ['POINT', 'POLYGON', 'LINESTRING', 'MULTIPOINT', 'MULTIPOLYGON']):
+                    geometry_columns.append(col)
+    
+    return geometry_columns
+
+def convert_wkb_to_geometry(wkb_data):
+    """Convert WKB data to Shapely geometry objects"""
+    try:
+        if isinstance(wkb_data, str):
+            # Try as hex string first
+            try:
+                return wkb.loads(wkb_data, hex=True)
+            except:
+                # Try as regular WKB
+                try:
+                    return wkb.loads(bytes.fromhex(wkb_data))
+                except:
+                    # Try as WKT
+                    return wkt.loads(wkb_data)
+        elif isinstance(wkb_data, bytes):
+            return wkb.loads(wkb_data)
+        else:
+            # Try to convert to string and parse as WKT
+            return wkt.loads(str(wkb_data))
+    except Exception as e:
+        print(f"Error converting WKB data: {e}")
+        return None
+
+def create_geodataframe_from_geometry(df, geometry_col, crs='EPSG:4326'):
+    """Create a GeoDataFrame from a dataframe with geometry column"""
+    try:
+        # Create a copy of the dataframe
+        gdf_data = df.copy()
+        
+        # Convert geometry column to Shapely geometries
+        geometries = []
+        for idx, geom_data in enumerate(gdf_data[geometry_col]):
+            if pd.isna(geom_data):
+                geometries.append(None)
+            else:
+                geom = convert_wkb_to_geometry(geom_data)
+                if geom is not None:
+                    geometries.append(geom)
+                else:
+                    geometries.append(None)
+        
+        # Replace the geometry column with converted geometries
+        gdf_data[geometry_col] = geometries
+        
+        # Remove rows with invalid geometries
+        gdf_data = gdf_data.dropna(subset=[geometry_col])
+        
+        # Create GeoDataFrame
+        gdf = gpd.GeoDataFrame(gdf_data, geometry=geometry_col, crs=crs)
+        
+        return gdf
+        
+    except Exception as e:
+        print(f"Error creating GeoDataFrame: {e}")
+        return None
 
 def get_parameter_translations():
     """Get parameter translations from English to Portuguese"""
@@ -1800,19 +2270,23 @@ def main():
         help=t('upload_help')
     )
     
-    # GeoJSON uploads for kriging maps
-    st.sidebar.subheader("🗺️ Kriging Map Data")
-    points_file = st.sidebar.file_uploader(
-        "Upload Points GeoJSON",
-        type=['geojson'],
-        help="Upload GeoJSON file containing soil sample points with coordinates and parameter values"
+    # Geometry column selection for kriging maps (will be shown after file upload)
+    geometry_cols = None
+    points_geometry_col = None
+    polygon_geometry_col = None
+    
+    # Polygon geometry upload
+    polygon_file = st.sidebar.file_uploader(
+        "Upload Polygon Geometry",
+        type=['geojson', 'shp', 'gpkg'],
+        help="Upload GeoJSON, Shapefile, or GeoPackage containing field boundaries/polygons"
     )
     
-    polygon_file = st.sidebar.file_uploader(
-        "Upload Polygon GeoJSON", 
-        type=['geojson'],
-        help="Upload GeoJSON file containing field boundaries or area polygons"
-    )
+    # Store polygon file in session state
+    if polygon_file is not None:
+        st.session_state['polygon_file'] = polygon_file
+    else:
+        st.session_state['polygon_file'] = None
     
     # Project name input
     project_name = st.sidebar.text_input(
@@ -1887,6 +2361,10 @@ def main():
                     st.session_state['classified_df'] = classified_df
                     st.session_state['summary_stats'] = summary_stats
                     st.session_state['project_name'] = project_name
+                    
+                    # Detect geometry columns
+                    geometry_cols = detect_geometry_columns(classified_df)
+                    st.session_state['geometry_cols'] = geometry_cols
                 
                 st.success(t('classification_completed'))
             
@@ -1894,6 +2372,31 @@ def main():
             if 'classified_df' in st.session_state:
                 classified_df = st.session_state['classified_df']
                 summary_stats = st.session_state['summary_stats']
+                geometry_cols = st.session_state.get('geometry_cols', [])
+                
+                # Geometry column selection in sidebar
+                if geometry_cols:
+                    st.sidebar.subheader("🗺️ Points Geometry Selection")
+                    
+                    # Points geometry column (from Excel file)
+                    points_geometry_col = st.sidebar.selectbox(
+                        "Select Points Geometry Column",
+                        options=['None'] + geometry_cols,
+                        help="Select the column containing point geometries (soil sample locations) from your Excel file"
+                    )
+                    
+                    # CRS selection
+                    crs_input = st.sidebar.text_input(
+                        "Coordinate Reference System (CRS)",
+                        value="EPSG:4326",
+                        help="Enter the CRS code (e.g., EPSG:4326 for WGS84)"
+                    )
+                    
+                    # Store selections in session state
+                    st.session_state['points_geometry_col'] = points_geometry_col if points_geometry_col != 'None' else None
+                    st.session_state['crs_input'] = crs_input
+                else:
+                    st.sidebar.info("ℹ️ No geometry columns detected in the uploaded file. Kriging maps will not be available.")
                 
                 # Main content area
                 col1, col2, col3 = st.columns(3)
@@ -1962,19 +2465,29 @@ def main():
                     
                     if selected_param:
                         # Create tabs for different analysis types
-                        tab1, tab2, tab3, tab4 = st.tabs([
+                        tab1, tab2, tab3, tab4, tab5 = st.tabs([
                             t('distribution'), 
                             t('box_plot'), 
                             t('statistics'), 
-                            t('comparison')
+                            t('comparison'),
+                            "🗺️ Spatial Plots"
                         ])
                         
                         with tab1:
+                            # Distribution chart options
+                            col1, col2 = st.columns([3, 1])
+                            with col2:
+                                separate_by_classification = st.checkbox(
+                                    "Separate by Classification",
+                                    value=False,
+                                    help="Show each classification level in separate subplots"
+                                )
+                            
                             # Distribution chart
                             if group_by_cols:
-                                param_fig = create_parameter_chart(classified_df, selected_param, group_by_cols, param_col, value_col)
+                                param_fig = create_parameter_chart(classified_df, selected_param, group_by_cols, param_col, value_col, separate_by_classification)
                             else:
-                                param_fig = create_parameter_chart(classified_df, selected_param, None, param_col, value_col)
+                                param_fig = create_parameter_chart(classified_df, selected_param, None, param_col, value_col, separate_by_classification)
                             
                             if param_fig:
                                 st.plotly_chart(param_fig, use_container_width=True)
@@ -2152,8 +2665,8 @@ def main():
                                 param_summary = complete_stats.groupby(param_col).agg(col_map).round(3)
                                 
                                 st.dataframe(param_summary, use_container_width=True)
-                    else:
-                        st.info(t('no_grouping_columns'))
+                        else:
+                            st.info(t('no_grouping_columns'))
                 
                 # Data table
                 with st.expander(t('classified_data'), expanded=False):
@@ -2161,18 +2674,153 @@ def main():
                     display_df = classified_df.copy()
                     display_df["Classificação"] = display_df["Classificação"].apply(translate_classification)
                     st.dataframe(display_df, use_container_width=True)
+                        
+                    with tab5:
+                        # Spatial Plots Section
+                        st.markdown("#### 🗺️ Spatial Visualization")
+                        
+                        # Check if we have spatial data
+                        points_geometry_col = st.session_state.get('points_geometry_col')
+                        polygon_file = st.session_state.get('polygon_file', None)
+                        
+                        if points_geometry_col and polygon_file is not None:
+                            try:
+                                # Create GeoDataFrames
+                                points_gdf = create_geodataframe_from_geometry(
+                                    classified_df, points_geometry_col, 
+                                    st.session_state.get('crs_input', 'EPSG:4326')
+                                )
+                                
+                                if polygon_file.name.endswith('.geojson'):
+                                    polygon_gdf = gpd.read_file(polygon_file)
+                                elif polygon_file.name.endswith('.shp'):
+                                    polygon_gdf = gpd.read_file(polygon_file)
+                                elif polygon_file.name.endswith('.gpkg'):
+                                    polygon_gdf = gpd.read_file(polygon_file)
+                                
+                                if points_gdf is not None and polygon_gdf is not None:
+                                    # Spatial plot controls
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col1:
+                                        # Plot type selection
+                                        plot_type = st.selectbox(
+                                            "Plot Type",
+                                            options=["Single Plot", "Comparison Plot"],
+                                            help="Choose between single plot or comparison plot with two panels"
+                                        )
+                                    
+                                    with col2:
+                                        # Color scheme
+                                        cmap = st.selectbox(
+                                            "Color Scheme",
+                                            options=["viridis", "plasma", "inferno", "magma", "cividis", "RdYlBu_r"],
+                                            index=0,
+                                            help="Choose color scheme for the plot"
+                                        )
+                                    
+                                    # Filter controls
+                                    col3, col4 = st.columns(2)
+                                    
+                                    with col3:
+                                        # Purpose filter
+                                        purpose_options = ["All"]
+                                        if 'sampling_plan_purpose' in points_gdf.columns:
+                                            purpose_options.extend(points_gdf['sampling_plan_purpose'].unique())
+                                        selected_purpose = st.selectbox(
+                                            "Sampling Purpose Filter:",
+                                            options=purpose_options,
+                                            key="spatial_purpose"
+                                        )
+                                    
+                                    with col4:
+                                        # Depth filter
+                                        depth_options = ["All"]
+                                        if 'depth_range_bottom_m' in points_gdf.columns:
+                                            depth_options.extend(sorted(points_gdf['depth_range_bottom_m'].unique()))
+                                        selected_depth = st.selectbox(
+                                            "Depth Filter:",
+                                            options=depth_options,
+                                            key="spatial_depth"
+                                        )
+                                    
+                                    # Generate spatial plot
+                                    if st.button("Generate Spatial Plot", type="primary"):
+                                        with st.spinner("Generating spatial plot..."):
+                                            try:
+                                                if plot_type == "Single Plot":
+                                                    spatial_fig = create_spatial_plot(
+                                                        points_gdf, selected_param,
+                                                        polygon_gdf=polygon_gdf,
+                                                        purpose_filter=selected_purpose if selected_purpose != "All" else None,
+                                                        depth_filter=selected_depth if selected_depth != "All" else None,
+                                                        param_col=param_col,
+                                                        value_col=value_col,
+                                                        cmap=cmap
+                                                    )
+                                                else:  # Comparison Plot
+                                                    # Get available purposes for comparison
+                                                    available_purposes = []
+                                                    if 'sampling_plan_purpose' in points_gdf.columns:
+                                                        available_purposes = list(points_gdf['sampling_plan_purpose'].unique())
+                                                    
+                                                    if len(available_purposes) >= 2:
+                                                        spatial_fig = create_spatial_comparison_plot(
+                                                            points_gdf, selected_param,
+                                                            polygon_gdf=polygon_gdf,
+                                                            purposes=(available_purposes[0], available_purposes[1]),
+                                                            param_col=param_col,
+                                                            value_col=value_col,
+                                                            cmap=cmap
+                                                        )
+                                                    else:
+                                                        st.warning("Need at least 2 different sampling purposes for comparison plot")
+                                                        spatial_fig = None
+                                                
+                                                if spatial_fig:
+                                                    st.pyplot(spatial_fig, use_container_width=True)
+                                                    plt.close(spatial_fig)  # Close to free memory
+                                                else:
+                                                    st.error("Failed to generate spatial plot. Check your data and filters.")
+                                                    
+                                            except Exception as e:
+                                                st.error(f"Error generating spatial plot: {str(e)}")
+                                
+                            except Exception as e:
+                                st.error(f"Error loading spatial data: {str(e)}")
+                        else:
+                            if not points_geometry_col:
+                                st.info("ℹ️ Please select a points geometry column in the sidebar to enable spatial plots.")
+                            if not polygon_file:
+                                st.info("ℹ️ Please upload a polygon geometry file in the sidebar to enable spatial plots.")
             
             # Kriging Maps Section
-            if points_file is not None and polygon_file is not None:
+            points_geometry_col = st.session_state.get('points_geometry_col')
+            crs_input = st.session_state.get('crs_input', 'EPSG:4326')
+            
+            if points_geometry_col and polygon_file is not None:
                 st.subheader("🗺️ Kriging Maps")
                 
                 try:
-                    # Load GeoJSON files
-                    points_gdf = gpd.read_file(points_file)
-                    polygon_gdf = gpd.read_file(polygon_file)
-                    polygon_gdf = polygon_gdf.to_crs(points_gdf.crs)
+                    # Create points GeoDataFrame from Excel geometry column
+                    points_gdf = create_geodataframe_from_geometry(classified_df, points_geometry_col, crs_input)
                     
-                    st.success("✅ GeoJSON files loaded successfully!")
+                    # Load polygon GeoDataFrame from uploaded file
+                    if polygon_file.name.endswith('.geojson'):
+                        polygon_gdf = gpd.read_file(polygon_file)
+                    elif polygon_file.name.endswith('.shp'):
+                        # For shapefile, we need to handle the .shp file specifically
+                        polygon_gdf = gpd.read_file(polygon_file)
+                    elif polygon_file.name.endswith('.gpkg'):
+                        polygon_gdf = gpd.read_file(polygon_file)
+                    
+                    if points_gdf is None or polygon_gdf is None:
+                        st.error("❌ Failed to load geometry data")
+                    else:
+                        # Ensure both GeoDataFrames have the same CRS
+                        polygon_gdf = polygon_gdf.to_crs(points_gdf.crs)
+                        
+                        st.success("✅ Geometry data loaded successfully!")
                     
                     # Map configuration
                     col1, col2, col3 = st.columns(3)
@@ -2363,8 +3011,13 @@ def main():
                                 st.dataframe(polygon_gdf.head())
                 
                 except Exception as e:
-                    st.error(f"❌ Error loading GeoJSON files: {str(e)}")
-                    st.info("Please ensure your GeoJSON files are valid and contain the required geometry and attribute data.")
+                    st.error(f"❌ Error processing geometry data: {str(e)}")
+                    st.info("Please ensure your points geometry column contains valid WKB/WKT data and your polygon file is a valid GeoJSON, Shapefile, or GeoPackage.")
+            else:
+                if not points_geometry_col:
+                    st.info("ℹ️ Please select a points geometry column from your Excel file to enable kriging maps.")
+                if polygon_file is None:
+                    st.info("ℹ️ Please upload a polygon geometry file (GeoJSON, Shapefile, or GeoPackage) to enable kriging maps.")
             
             # Report Generation
             st.subheader(t('pdf_report_generation'))
@@ -2399,44 +3052,44 @@ def main():
                             
                         except Exception as e:
                             st.error(f"{t('pdf_error')} {str(e)}")
-            
-            with col2:
-                if st.button(t('generate_docx'), type="secondary"):
-                    with st.spinner(t('generating_docx')):
-                        try:
-                            # Pass geospatial data and other parameters for kriging maps
-                            docx_content = generate_docx_report(
-                                classified_df, 
-                                summary_stats, 
-                                None,  # charts_data placeholder
-                                st.session_state.get('project_name', t('default_project')),
-                                points_gdf=points_gdf if 'points_gdf' in locals() else None,
-                                polygon_gdf=polygon_gdf if 'polygon_gdf' in locals() else None,
-                                classifier=classifier,
-                                param_col=param_col if 'param_col' in locals() else None,
-                                value_col=value_col if 'value_col' in locals() else None,
-                                purpose_filter=purpose_filter if 'purpose_filter' in locals() else None,
-                                depth_filter=depth_filter if 'depth_filter' in locals() else None
-                            )
-                            
-                            # Create download button for DOCX
-                            st.download_button(
-                                label=t('download_docx'),
-                                data=docx_content,
-                                file_name=f"relatorio_solo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                            )
-                            
-                            st.success(t('docx_generated'))
-                            
-                        except Exception as e:
-                            st.error(f"{t('docx_error')} {str(e)}")
+                
+                with col2:
+                    if st.button(t('generate_docx'), type="secondary"):
+                        with st.spinner(t('generating_docx')):
+                            try:
+                                # Pass geospatial data and other parameters for kriging maps
+                                docx_content = generate_docx_report(
+                                    classified_df, 
+                                    summary_stats, 
+                                    None,  # charts_data placeholder
+                                    st.session_state.get('project_name', t('default_project')),
+                                    points_gdf=points_gdf if 'points_gdf' in locals() else None,
+                                    polygon_gdf=polygon_gdf if 'polygon_gdf' in locals() else None,
+                                    classifier=classifier,
+                                    param_col=param_col if 'param_col' in locals() else None,
+                                    value_col=value_col if 'value_col' in locals() else None,
+                                    purpose_filter=purpose_filter if 'purpose_filter' in locals() else None,
+                                    depth_filter=depth_filter if 'depth_filter' in locals() else None
+                                )
+                                
+                                # Create download button for DOCX
+                                st.download_button(
+                                    label=t('download_docx'),
+                                    data=docx_content,
+                                    file_name=f"relatorio_solo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                )
+                                
+                                st.success(t('docx_generated'))
+                                
+                            except Exception as e:
+                                st.error(f"{t('docx_error')} {str(e)}")
             
             with col3:
                 # Excel download with colors
                 output = io.BytesIO()
-                current_language = st.session_state.get('language', 'pt')
-                
+                current_language = st.session_state.get('language', 'en')
+                    
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     # Prepare export dataframe
                     export_df = classified_df.copy()

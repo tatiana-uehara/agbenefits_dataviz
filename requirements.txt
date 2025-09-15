@@ -12,3 +12,4 @@ affine>=2.3.0
 matplotlib>=3.5.0
 pykrige>=1.6.0
 python-docx>=0.8.11
+scipy>=1.7.0
