@@ -471,7 +471,7 @@ def create_classification_summary(df):
         "classification_percentages": {k: (v/total)*100 for k, v in summary.items()}
     }
 
-def create_parameter_chart(df, param_name, group_by_col=None, param_col="Parâmetro", value_col="Resultado numérico"):
+def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâmetro", value_col="Resultado numérico"):
     """Create chart for specific parameter with optional grouping"""
     if param_col not in df.columns:
         return None
@@ -486,18 +486,43 @@ def create_parameter_chart(df, param_name, group_by_col=None, param_col="Parâme
     # Translate parameter name for display
     display_param_name = translate_parameter_for_display(param_name)
     
-    if group_by_col and group_by_col in param_data.columns:
-        # Create grouped histogram
-        fig = px.histogram(
-            param_data, 
-            x=value_col, 
-            color=group_by_col,
-            facet_col="Classificação_Display",
-            title=f"{t('distribution')} - {display_param_name} por {group_by_col}",
-            labels={value_col: "Valor", "count": "Frequência"},
-            barmode="overlay"
-        )
-        fig.update_traces(opacity=0.7)
+    # Handle multiple grouping columns
+    if group_by_cols:
+        # Filter to only include columns that exist in the data
+        valid_group_cols = [col for col in group_by_cols if col in param_data.columns]
+        
+        if valid_group_cols:
+            # Create a combined grouping column for multiple filters
+            if len(valid_group_cols) == 1:
+                combined_group_col = valid_group_cols[0]
+            else:
+                # Create a combined grouping column
+                param_data['Combined_Group'] = param_data[valid_group_cols].apply(
+                    lambda row: ' | '.join([f"{col}: {row[col]}" for col in valid_group_cols]), 
+                    axis=1
+                )
+                combined_group_col = 'Combined_Group'
+            
+            # Create grouped histogram
+            fig = px.histogram(
+                param_data, 
+                x=value_col, 
+                color=combined_group_col,
+                facet_col="Classificação_Display",
+                title=f"{t('distribution')} - {display_param_name} por {' + '.join(valid_group_cols)}",
+                labels={value_col: "Valor", "count": "Frequência"},
+                barmode="overlay"
+            )
+            fig.update_traces(opacity=0.7)
+        else:
+            # Fallback to classification-only grouping
+            fig = px.histogram(
+                param_data, 
+                x=value_col, 
+                color="Classificação_Display",
+                title=f"{t('distribution')} - {display_param_name}",
+                labels={value_col: "Valor", "count": "Frequência"}
+            )
     else:
         # Default histogram by classification
         fig = px.histogram(
@@ -511,9 +536,9 @@ def create_parameter_chart(df, param_name, group_by_col=None, param_col="Parâme
     fig.update_layout(height=400)
     return fig
 
-def create_box_plot(df, param_name, group_by_col, param_col="Parâmetro", value_col="Resultado numérico"):
-    """Create box plot for parameter grouped by specified column"""
-    if param_col not in df.columns or group_by_col not in df.columns or value_col not in df.columns:
+def create_box_plot(df, param_name, group_by_cols, param_col="Parâmetro", value_col="Resultado numérico"):
+    """Create box plot for parameter grouped by specified columns"""
+    if param_col not in df.columns or value_col not in df.columns:
         return None
     
     param_data = df[df[param_col] == param_name].copy()
@@ -523,14 +548,36 @@ def create_box_plot(df, param_name, group_by_col, param_col="Parâmetro", value_
     # Translate parameter name for display
     display_param_name = translate_parameter_for_display(param_name)
     
-    fig = px.box(
-        param_data,
-        x=group_by_col,
-        y=value_col,
-        color=group_by_col,
-        title=f"{t('distribution')} de {display_param_name} por {group_by_col}",
-        labels={value_col: "Valor"}
-    )
+    # Handle multiple grouping columns
+    if group_by_cols:
+        # Filter to only include columns that exist in the data
+        valid_group_cols = [col for col in group_by_cols if col in param_data.columns]
+        
+        if valid_group_cols:
+            # Create a combined grouping column for multiple filters
+            if len(valid_group_cols) == 1:
+                combined_group_col = valid_group_cols[0]
+            else:
+                # Create a combined grouping column
+                param_data['Combined_Group'] = param_data[valid_group_cols].apply(
+                    lambda row: ' | '.join([f"{col}: {row[col]}" for col in valid_group_cols]), 
+                    axis=1
+                )
+                combined_group_col = 'Combined_Group'
+            
+            fig = px.box(
+                param_data,
+                x=combined_group_col,
+                y=value_col,
+                color=combined_group_col,
+                title=f"{t('distribution')} de {display_param_name} por {' + '.join(valid_group_cols)}",
+                labels={value_col: "Valor"}
+            )
+        else:
+            return None
+    else:
+        return None
+    
     fig.update_layout(height=400)
     return fig
 
@@ -1762,24 +1809,22 @@ def main():
                         )
                     
                     with col2:
-                        # Group by column selection with display names
+                        # Group by column selection with display names (multiselect)
                         display_to_actual = get_grouping_columns_with_display_names(
                             classified_df, 
                             [param_col, value_col, "Classificação"]
                         )
                         
-                        display_options = [t('classification_breakdown').replace('📋 ', '')] + list(display_to_actual.keys())
-                        selected_display_name = st.selectbox(
-                            t('group_by'),
+                        display_options = list(display_to_actual.keys())
+                        selected_display_names = st.multiselect(
+                            t('group_by') + " (Multiple Selection)",
                             options=display_options,
-                            help=t('group_help')
+                            help=t('group_help') + " - You can select multiple columns to aggregate by multiple filters",
+                            default=[]
                         )
                         
-                        # Get actual column name
-                        if selected_display_name == t('classification_breakdown').replace('📋 ', ''):
-                            group_by_col = selected_display_name
-                        else:
-                            group_by_col = display_to_actual.get(selected_display_name, selected_display_name)
+                        # Get actual column names
+                        group_by_cols = [display_to_actual.get(display_name, display_name) for display_name in selected_display_names]
                     
                     if selected_param:
                         # Create tabs for different analysis types
@@ -1792,8 +1837,8 @@ def main():
                         
                         with tab1:
                             # Distribution chart
-                            if group_by_col != t('classification_breakdown').replace('📋 ', ''):
-                                param_fig = create_parameter_chart(classified_df, selected_param, group_by_col, param_col, value_col)
+                            if group_by_cols:
+                                param_fig = create_parameter_chart(classified_df, selected_param, group_by_cols, param_col, value_col)
                             else:
                                 param_fig = create_parameter_chart(classified_df, selected_param, None, param_col, value_col)
                             
@@ -1802,37 +1847,24 @@ def main():
                         
                         with tab2:
                             # Box plot
-                            if group_by_col in classified_df.columns:
-                                box_fig = create_box_plot(classified_df, selected_param, group_by_col, param_col, value_col)
+                            if group_by_cols:
+                                box_fig = create_box_plot(classified_df, selected_param, group_by_cols, param_col, value_col)
                                 if box_fig:
                                     st.plotly_chart(box_fig, use_container_width=True)
                                 else:
                                     st.info(t('box_plot_unavailable'))
+                            else:
+                                st.info("Please select at least one grouping column to create box plots")
                         
                         with tab3:
                             # Statistical summary
                             st.markdown(f"#### {t('statistical_summary')}")
                             
-                            # Multi-select for grouping columns with display names
-                            display_to_actual_stats = get_grouping_columns_with_display_names(
-                                classified_df, 
-                                [param_col, value_col, "Classificação"]
-                            )
-                            
-                            selected_display_groups = st.multiselect(
-                                t('select_grouping'),
-                                options=list(display_to_actual_stats.keys()),
-                                default=[translate_column_for_display(group_by_col)] if group_by_col in classified_df.columns else [],
-                                help=t('grouping_help')
-                            )
-                            
-                            # Convert display names back to actual column names
-                            selected_groups = [display_to_actual_stats[display_name] for display_name in selected_display_groups]
-                            
-                            if selected_groups:
+                            # Use the same grouping columns as selected for plots
+                            if group_by_cols:
                                 stats_df = create_statistical_summary(
                                     classified_df, 
-                                    selected_groups, 
+                                    group_by_cols, 
                                     param_col, 
                                     value_col
                                 )
@@ -1853,8 +1885,10 @@ def main():
                                         )
                                     else:
                                         st.info(t('no_stats_available'))
+                                else:
+                                    st.error("Failed to generate statistical summary")
                             else:
-                                st.info(t('select_one_column'))
+                                st.info("Please select grouping columns to view statistical summary")
                         
                         with tab4:
                             # Comparison charts
