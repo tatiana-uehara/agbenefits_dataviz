@@ -33,6 +33,9 @@ from docx import Document
 from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from dotenv import load_dotenv
+import binascii
+import sys
 
 # Excel formatting imports
 from openpyxl.styles import PatternFill
@@ -254,8 +257,137 @@ TRANSLATIONS = {
 # Language mapping for statistics
 STAT_NAMES = {
     'pt': {'mean': 'Média', 'std': 'Desvio Padrão', 'median': 'Mediana'},
-    'en': {'mean': 'Mean', 'std': 'Standard Deviation', 'median': 'Median'}
+    'en': {'mean': 'Mean', 'std': 'Standard Deviation', 'median': 'Median'    }
 }
+
+# Database retrieval functions - using agbenefits pipeline connection method
+def setup_database_connection():
+    """Setup database connection using the same method as agbenefits pipeline"""
+    try:
+        # Load environment variables first
+        load_dotenv()
+        
+        # Import the local database utilities
+        from utils.db import get_terradot_db_session, read_pd_from_db_sql
+        
+        # Test the connection
+        connection = get_terradot_db_session()
+        if connection is None:
+            st.error("❌ Database connection failed - check environment variables")
+            st.info("Required environment variables: DB_HOST, DB_NAME, DB_USER")
+            return None
+            
+        connection.close()
+        
+        st.success("✅ Database connection configured using agbenefits pipeline method")
+        return True
+        
+    except ImportError as e:
+        st.error(f"❌ Could not import database utilities: {str(e)}")
+        st.info("Make sure the utils/db.py file is in the correct location")
+        return None
+    except Exception as e:
+        st.error(f"❌ Database connection failed: {str(e)}")
+        return None
+
+def execute_sql_query(query, connection):
+    """Execute SQL query and return DataFrame"""
+    try:
+        return pd.read_sql(query, connection)
+    except Exception as e:
+        st.error(f"Error executing query: {str(e)}")
+        return pd.DataFrame()
+
+def retrieve_soil_samples_from_db(field_id):
+    """Retrieve soil samples from database using agbenefits pipeline method"""
+    try:
+        # Import the local database utilities
+        from utils.db import get_terradot_db_session, read_pd_from_db_sql
+        
+        # Read SQL queries
+        composite_query_path = "agbenefits_get_composite_samples.sql"
+        noncomposite_query_path = "agbenefits_get_NoNcomposite_samples.sql"
+        
+        # Load composite samples query
+        with open(composite_query_path, 'r') as file:
+            composite_query = file.read().format(field_id=field_id)
+        
+        # Load non-composite samples query
+        with open(noncomposite_query_path, 'r') as file:
+            noncomposite_query = file.read().format(field_id=field_id)
+        
+        # Execute queries using agbenefits pipeline method
+        connection = get_terradot_db_session()
+        try:
+            # Try composite samples first
+            composite_df = read_pd_from_db_sql(composite_query, connection)
+            st.info(f"Number of composite samples: {len(composite_df)}")
+            
+            # Try non-composite samples
+            noncomposite_df = read_pd_from_db_sql(noncomposite_query, connection)
+            st.info(f"Number of non-composite samples: {len(noncomposite_df)}")
+            
+            # Combine results (same logic as agbenefits pipeline)
+            if len(composite_df) != 0 and len(noncomposite_df) != 0:
+                combined_df = pd.concat([composite_df, noncomposite_df], ignore_index=True)
+            elif len(composite_df) != 0:
+                combined_df = composite_df
+            elif len(noncomposite_df) != 0:
+                combined_df = noncomposite_df
+            else:
+                st.warning(f"No soil samples found for field_id: {field_id}")
+                combined_df = pd.DataFrame()
+                
+        finally:
+            connection.close()
+            
+        return combined_df
+        
+    except Exception as e:
+        st.error(f"Error retrieving soil samples: {str(e)}")
+        return pd.DataFrame()
+
+def retrieve_field_boundaries_from_db(field_id):
+    """Retrieve field boundaries from database using agbenefits pipeline method"""
+    try:
+        # Import the local database utilities
+        from utils.db import get_terradot_db_session, read_pd_from_db_sql
+        
+        # Read plot boundaries SQL query (same as agbenefits pipeline)
+        boundary_query_path = "get_plot_boundaries.sql"
+        with open(boundary_query_path, 'r') as file:
+            boundary_query = file.read().format(field_id=field_id)
+        
+        # Execute query using agbenefits pipeline method
+        connection = get_terradot_db_session()
+        try:
+            boundary_df = read_pd_from_db_sql(boundary_query, connection)
+            
+            if boundary_df.empty:
+                return None
+            
+            # Convert WKB to geometry
+            geometries = []
+            for wkb_data in boundary_df['boundary']:
+                try:
+                    if isinstance(wkb_data, str) and wkb_data.startswith('\\x'):
+                        wkb_bytes = binascii.unhexlify(wkb_data[2:])
+                    else:
+                        wkb_bytes = binascii.unhexlify(wkb_data)
+                    geometries.append(wkb.loads(wkb_bytes))
+                except:
+                    geometries.append(None)
+            
+            # Create GeoDataFrame
+            gdf = gpd.GeoDataFrame(boundary_df, geometry=geometries, crs='EPSG:4326')
+            return gdf
+            
+        finally:
+            connection.close()
+        
+    except Exception as e:
+        st.error(f"Error retrieving field boundaries: {str(e)}")
+        return None
 
 # Set page config
 st.set_page_config(
@@ -648,21 +780,21 @@ def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâm
                             opacity=0.7,
                             line=dict(width=2)
                         ))
-            
-            if separate_by_classification:
-                fig.update_layout(
-                    title=f"{t('distribution')} - {display_param_name}",
-                    height=400
-                )
-                fig.update_xaxes(title_text="Valor")
-                fig.update_yaxes(title_text="Density")
-            else:
-                fig.update_layout(
-                    title=f"{t('distribution')} - {display_param_name}",
-                    xaxis_title="Valor",
-                    yaxis_title="Density",
-                    height=400
-                )
+        
+        if separate_by_classification:
+            fig.update_layout(
+                title=f"{t('distribution')} - {display_param_name}",
+                height=400
+            )
+            fig.update_xaxes(title_text="Valor")
+            fig.update_yaxes(title_text="Density")
+        else:
+            fig.update_layout(
+                title=f"{t('distribution')} - {display_param_name}",
+                xaxis_title="Valor",
+                yaxis_title="Density",
+                height=400
+            )
     else:
         # No valid group columns, create default KDE plot by classification
         classifications = param_data["Classificação_Display"].unique()
@@ -672,9 +804,9 @@ def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâm
             values = classification_data[value_col].dropna()
             
             if len(values) > 1:
-                x_vals, density = create_kde_curve(values, x_range)
-                
-                if separate_by_classification:
+                    x_vals, density = create_kde_curve(values, x_range)
+                    
+                    if separate_by_classification:
                         # Add to specific subplot
                         fig.add_trace(go.Scatter(
                             x=x_vals,
@@ -686,17 +818,17 @@ def create_parameter_chart(df, param_name, group_by_cols=None, param_col="Parâm
                             line=dict(width=2),
                             showlegend=False  # No legend needed for single classification per subplot
                         ), row=1, col=i+1)
-                else:
+                    else:
                         # Add to single plot
                         fig.add_trace(go.Scatter(
-                            x=x_vals,
-                            y=density,
-                            mode='lines',
-                            fill='tozeroy',
-                            name=classification,
-                            opacity=0.7,
-                            line=dict(width=2)
-                        ))
+                                x=x_vals,
+                                y=density,
+                                mode='lines',
+                                fill='tozeroy',
+                                name=classification,
+                                opacity=0.7,
+                                line=dict(width=2)
+                            ))
         
         if separate_by_classification:
             fig.update_layout(
@@ -2263,6 +2395,175 @@ def main():
     # Sidebar
     st.sidebar.header(t('settings'))
     
+    # Database connection section
+    st.sidebar.subheader("🗄️ Database Connection")
+    use_database = st.sidebar.checkbox("Load data from database", help="Check this to load data directly from the database instead of uploading files")
+    
+    if use_database:
+        # Database configuration
+        st.sidebar.markdown("**Database Configuration:**")
+        
+        st.sidebar.info("ℹ️ Using agbenefits pipeline database connection method")
+        st.sidebar.markdown("**Requirements:**")
+        st.sidebar.markdown("- Active gcloud session (same as agbenefits pipeline)")
+        st.sidebar.markdown("- utils/db.py file in project directory")
+        st.sidebar.markdown("- Environment variables: DB_HOST, DB_NAME, DB_USER")
+        
+        # Check if .env file exists
+        env_file_exists = os.path.exists('.env')
+        if not env_file_exists:
+            st.sidebar.warning("⚠️ .env file not found")
+            st.sidebar.markdown("**Create a .env file with:**")
+            st.sidebar.code("""
+DB_HOST=your_host
+DB_NAME=your_database
+DB_USER=your_username
+DB_PORT=5432
+            """)
+        else:
+            st.sidebar.success("✅ .env file found")
+        
+        # Try to setup database connection using agbenefits pipeline method
+        db_connection_ok = setup_database_connection()
+        
+        if db_connection_ok:
+            # Field ID input
+            field_id = st.sidebar.number_input(
+                "Field ID",
+                min_value=1,
+                value=1,
+                help="Enter the field ID to retrieve data for"
+            )
+            
+            # Load data button
+            if st.sidebar.button("Load Data from Database", type="primary"):
+                with st.spinner("Loading data from database..."):
+                    # Retrieve soil samples
+                    soil_samples_df = retrieve_soil_samples_from_db(field_id)
+                    
+                    if not soil_samples_df.empty:
+                        st.success(f"✅ Loaded {len(soil_samples_df)} soil samples from database")
+                        
+                        # Store raw data in session state for column selection
+                        st.session_state['raw_db_data'] = soil_samples_df
+                        st.session_state['data_source'] = 'database'
+                        st.session_state['field_id'] = field_id
+                        st.session_state['db_data_loaded'] = True
+                    else:
+                        st.error("❌ No soil samples found for the specified field ID")
+            
+            # Show column selection if database data is loaded
+            if st.session_state.get('db_data_loaded', False) and 'raw_db_data' in st.session_state:
+                st.sidebar.markdown("**📊 Column Selection for Database Data:**")
+                
+                # Get all columns from the loaded data
+                soil_samples_df = st.session_state['raw_db_data']
+                all_columns = list(soil_samples_df.columns)
+                numeric_columns = list(soil_samples_df.select_dtypes(include=['number']).columns)
+                
+                # Parameter column selection
+                param_col = st.sidebar.selectbox(
+                    "Select Parameter Column",
+                    options=all_columns,
+                    index=0 if all_columns else None,
+                    help="Select the column that contains parameter names (e.g., 'parameter', 'analysis_type')"
+                )
+                
+                # Result column selection
+                result_col = st.sidebar.selectbox(
+                    "Select Result Column",
+                    options=numeric_columns,
+                    index=0 if numeric_columns else None,
+                    help="Select the column that contains numeric results (e.g., 'result', 'value', 'concentration')"
+                )
+                
+                # Geometry column selection
+                geom_col = st.sidebar.selectbox(
+                    "Select Geometry Column",
+                    options=all_columns,
+                    index=0 if all_columns else None,
+                    help="Select the column that contains geometry data (WKB, WKT, or coordinates)"
+                )
+                
+                # CRS input for geometry
+                crs_input = st.sidebar.text_input(
+                    "CRS (Coordinate Reference System)",
+                    value="EPSG:4326",
+                    help="Enter the CRS for the geometry data (e.g., EPSG:4326, EPSG:3857)"
+                )
+                
+                # Show data preview
+                with st.sidebar.expander("📋 Data Preview", expanded=False):
+                    st.write("**Available columns:**")
+                    for col in all_columns:
+                        st.write(f"- {col}")
+                    
+                    st.write(f"\n**Data shape:** {soil_samples_df.shape[0]} rows × {soil_samples_df.shape[1]} columns")
+                    
+                    st.write("**First few rows:**")
+                    st.dataframe(soil_samples_df.head(3), use_container_width=True)
+                
+                # Process button
+                if st.sidebar.button("Process Database Data", type="primary"):
+                    if param_col and result_col and geom_col:
+                        # Process the data similar to file upload
+                        try:
+                            # Create a processed dataframe similar to file upload
+                            processed_df = soil_samples_df.copy()
+                            
+                            # Rename columns to match expected format
+                            processed_df = processed_df.rename(columns={
+                                param_col: 'Parameter',
+                                result_col: 'Result',
+                                geom_col: 'geometry'
+                            })
+                            
+                            # Create geometry column
+                            points_gdf = create_geodataframe_from_geometry(processed_df, 'geometry', crs_input)
+                            
+                            if points_gdf is not None:
+                                # Convert geometry to string for session state compatibility
+                                gdf_for_session = points_gdf.copy()
+                                if 'geometry' in gdf_for_session.columns:
+                                    gdf_for_session['geometry'] = gdf_for_session['geometry'].astype(str)
+                                
+                                # Store processed data in session state
+                                st.session_state['uploaded_data'] = gdf_for_session
+                                st.session_state['data_source'] = 'database'
+                                st.session_state['field_id'] = field_id
+                                st.session_state['points_gdf'] = points_gdf
+                                
+                                st.success("✅ Database data processed successfully!")
+                                st.info(f"Processed {len(points_gdf)} records with geometry")
+                                
+                                # Try to retrieve field boundaries
+                                boundary_gdf = retrieve_field_boundaries_from_db(field_id)
+                                if boundary_gdf is not None:
+                                    st.success("✅ Loaded field boundaries from database")
+                                    # Save boundary to temporary file for compatibility
+                                    temp_boundary_file = tempfile.NamedTemporaryFile(delete=False, suffix='.geojson')
+                                    temp_boundary_file.close()  # Close the file handle first
+                                    boundary_gdf.to_file(temp_boundary_file.name, driver='GeoJSON')
+                                    # Store the temporary file path and GeoDataFrame
+                                    st.session_state['polygon_file'] = temp_boundary_file
+                                    st.session_state['polygon_gdf'] = boundary_gdf
+                                    st.info(f"Loaded {len(boundary_gdf)} polygon boundaries")
+                                else:
+                                    st.info("ℹ️ No field boundaries found in database")
+                            else:
+                                st.error("❌ Failed to process geometry data")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error processing data: {str(e)}")
+                    else:
+                        st.error("❌ Please select all required columns")
+    
+    # File upload (only show if not using database)
+    if not use_database:
+        st.sidebar.subheader("📁 File Upload")
+    else:
+        st.sidebar.subheader("📁 Alternative: File Upload")
+    
     # File upload
     uploaded_file = st.sidebar.file_uploader(
         t('upload_file'),
@@ -2295,13 +2596,21 @@ def main():
         help=t('project_help')
     )
     
-    if uploaded_file is not None:
+    # Check if data is available (either from file upload or database)
+    data_available = uploaded_file is not None or st.session_state.get('uploaded_data') is not None
+    
+    if data_available:
         try:
-            # Read file
-            if uploaded_file.name.endswith('.xlsx'):
-                df = pd.read_excel(uploaded_file)
+            # Determine data source and load accordingly
+            if uploaded_file is not None:
+                # Read file
+                if uploaded_file.name.endswith('.xlsx'):
+                    df = pd.read_excel(uploaded_file)
+                else:
+                    df = pd.read_csv(uploaded_file)
             else:
-                df = pd.read_csv(uploaded_file)
+                # Use database data
+                df = st.session_state['uploaded_data']
             
             # Keep original column names for user mapping
             # df = detect_and_translate_english_data(df)  # Removed automatic translation
@@ -2313,22 +2622,27 @@ def main():
                 st.dataframe(df.head(10))
                 st.info(f"{t('columns_available')} {', '.join(df.columns.tolist())}")
             
-            # Column mapping
-            st.sidebar.subheader(t('column_mapping'))
-            
-            param_col = st.sidebar.selectbox(
-                t('parameter_column'),
-                options=df.columns.tolist(),
-                index=0 if len(df.columns) > 0 else None,
-                help=t('parameter_help')
-            )
-            
-            value_col = st.sidebar.selectbox(
-                t('value_column'),
-                options=df.columns.tolist(),
-                index=1 if len(df.columns) > 1 else 0,
-                help=t('value_help')
-            )
+            # Column mapping (only for file uploads, database data is already processed)
+            if uploaded_file is not None:
+                st.sidebar.subheader(t('column_mapping'))
+                
+                param_col = st.sidebar.selectbox(
+                    t('parameter_column'),
+                    options=df.columns.tolist(),
+                    index=0 if len(df.columns) > 0 else None,
+                    help=t('parameter_help')
+                )
+                
+                value_col = st.sidebar.selectbox(
+                    t('value_column'),
+                    options=df.columns.tolist(),
+                    index=1 if len(df.columns) > 1 else 0,
+                    help=t('value_help')
+                )
+            else:
+                # For database data, use the already processed column names
+                param_col = 'Parameter'
+                value_col = 'Result'
             
             # Initialize classifier
             classifier = SoilClassifier()
@@ -2362,9 +2676,13 @@ def main():
                     st.session_state['summary_stats'] = summary_stats
                     st.session_state['project_name'] = project_name
                     
-                    # Detect geometry columns
-                    geometry_cols = detect_geometry_columns(classified_df)
-                    st.session_state['geometry_cols'] = geometry_cols
+                    # Detect geometry columns (only for file uploads)
+                    if uploaded_file is not None:
+                        geometry_cols = detect_geometry_columns(classified_df)
+                        st.session_state['geometry_cols'] = geometry_cols
+                    else:
+                        # For database data, geometry is already processed
+                        st.session_state['geometry_cols'] = []
                 
                 st.success(t('classification_completed'))
             
@@ -2375,15 +2693,20 @@ def main():
                 geometry_cols = st.session_state.get('geometry_cols', [])
                 
                 # Geometry column selection in sidebar
-                if geometry_cols:
+                if geometry_cols or st.session_state.get('points_gdf') is not None:
                     st.sidebar.subheader("🗺️ Points Geometry Selection")
                     
-                    # Points geometry column (from Excel file)
-                    points_geometry_col = st.sidebar.selectbox(
-                        "Select Points Geometry Column",
-                        options=['None'] + geometry_cols,
-                        help="Select the column containing point geometries (soil sample locations) from your Excel file"
-                    )
+                    if uploaded_file is not None and geometry_cols:
+                        # Points geometry column (from Excel file)
+                        points_geometry_col = st.sidebar.selectbox(
+                            "Select Points Geometry Column",
+                            options=['None'] + geometry_cols,
+                            help="Select the column containing point geometries (soil sample locations) from your Excel file"
+                        )
+                    else:
+                        # For database data, geometry is already processed
+                        points_geometry_col = 'geometry'
+                        st.info("✅ Points geometry loaded from database")
                     
                     # CRS selection
                     crs_input = st.sidebar.text_input(
@@ -2665,8 +2988,8 @@ def main():
                                 param_summary = complete_stats.groupby(param_col).agg(col_map).round(3)
                                 
                                 st.dataframe(param_summary, use_container_width=True)
-                        else:
-                            st.info(t('no_grouping_columns'))
+                    else:
+                        st.info(t('no_grouping_columns'))
                 
                 # Data table
                 with st.expander(t('classified_data'), expanded=False):
@@ -2683,20 +3006,52 @@ def main():
                         points_geometry_col = st.session_state.get('points_geometry_col')
                         polygon_file = st.session_state.get('polygon_file', None)
                         
-                        if points_geometry_col and polygon_file is not None:
+                        # For database data, check if we have processed geometry
+                        has_spatial_data = False
+                        if uploaded_file is not None:
+                            # File upload: check geometry column selection and polygon file
+                            has_spatial_data = points_geometry_col and polygon_file is not None
+                        else:
+                            # Database data: check if we have processed geometry data
+                            has_spatial_data = (st.session_state.get('points_gdf') is not None and 
+                                              (st.session_state.get('polygon_file') is not None or 
+                                               st.session_state.get('polygon_gdf') is not None))
+                        
+                        if has_spatial_data:
                             try:
                                 # Create GeoDataFrames
-                                points_gdf = create_geodataframe_from_geometry(
-                                    classified_df, points_geometry_col, 
-                                    st.session_state.get('crs_input', 'EPSG:4326')
-                                )
+                                if uploaded_file is not None:
+                                    # File upload: create from geometry column
+                                    points_gdf = create_geodataframe_from_geometry(
+                                        classified_df, points_geometry_col, 
+                                        st.session_state.get('crs_input', 'EPSG:4326')
+                                    )
+                                else:
+                                    # Database data: use already processed geometry
+                                    points_gdf = st.session_state.get('points_gdf')
                                 
-                                if polygon_file.name.endswith('.geojson'):
-                                    polygon_gdf = gpd.read_file(polygon_file)
-                                elif polygon_file.name.endswith('.shp'):
-                                    polygon_gdf = gpd.read_file(polygon_file)
-                                elif polygon_file.name.endswith('.gpkg'):
-                                    polygon_gdf = gpd.read_file(polygon_file)
+                                # Load polygon from uploaded file or database
+                                if uploaded_file is not None:
+                                    # File upload: load from uploaded file
+                                    if polygon_file is not None:
+                                        if polygon_file.name.endswith('.geojson'):
+                                            polygon_gdf = gpd.read_file(polygon_file)
+                                        elif polygon_file.name.endswith('.shp'):
+                                            polygon_gdf = gpd.read_file(polygon_file)
+                                        elif polygon_file.name.endswith('.gpkg'):
+                                            polygon_gdf = gpd.read_file(polygon_file)
+                                        else:
+                                            polygon_gdf = None
+                                    else:
+                                        polygon_gdf = None
+                                else:
+                                    # Database data: use stored GeoDataFrame or load from temporary file
+                                    polygon_gdf = st.session_state.get('polygon_gdf')
+                                    if polygon_gdf is None:
+                                        # Fallback to temporary file if GeoDataFrame not available
+                                        current_polygon_file = st.session_state.get('polygon_file')
+                                        if current_polygon_file is not None and hasattr(current_polygon_file, 'name'):
+                                            polygon_gdf = gpd.read_file(current_polygon_file.name)
                                 
                                 if points_gdf is not None and polygon_gdf is not None:
                                     # Spatial plot controls
@@ -2789,30 +3144,69 @@ def main():
                             except Exception as e:
                                 st.error(f"Error loading spatial data: {str(e)}")
                         else:
-                            if not points_geometry_col:
-                                st.info("ℹ️ Please select a points geometry column in the sidebar to enable spatial plots.")
-                            if not polygon_file:
-                                st.info("ℹ️ Please upload a polygon geometry file in the sidebar to enable spatial plots.")
+                            if uploaded_file is not None:
+                                # File upload mode
+                                if not points_geometry_col:
+                                    st.info("ℹ️ Please select a points geometry column in the sidebar to enable spatial plots.")
+                                if not polygon_file:
+                                    st.info("ℹ️ Please upload a polygon geometry file in the sidebar to enable spatial plots.")
+                            else:
+                                # Database mode
+                                if st.session_state.get('points_gdf') is None:
+                                    st.info("ℹ️ Please process the database data with geometry columns to enable spatial plots.")
+                                if (st.session_state.get('polygon_file') is None and 
+                                    st.session_state.get('polygon_gdf') is None):
+                                    st.info("ℹ️ Please process the database data to load polygon boundaries for spatial plots.")
             
             # Kriging Maps Section
             points_geometry_col = st.session_state.get('points_geometry_col')
             crs_input = st.session_state.get('crs_input', 'EPSG:4326')
             
-            if points_geometry_col and polygon_file is not None:
+            # Check if we have spatial data for kriging maps
+            has_kriging_data = False
+            if uploaded_file is not None:
+                # File upload: check geometry column selection and polygon file
+                has_kriging_data = points_geometry_col and polygon_file is not None
+            else:
+                # Database data: check if we have processed geometry data
+                has_kriging_data = (st.session_state.get('points_gdf') is not None and 
+                                  (st.session_state.get('polygon_file') is not None or 
+                                   st.session_state.get('polygon_gdf') is not None))
+            
+            if has_kriging_data:
                 st.subheader("🗺️ Kriging Maps")
                 
                 try:
-                    # Create points GeoDataFrame from Excel geometry column
-                    points_gdf = create_geodataframe_from_geometry(classified_df, points_geometry_col, crs_input)
+                    # Create points GeoDataFrame
+                    if uploaded_file is not None:
+                        # File upload: create from geometry column
+                        points_gdf = create_geodataframe_from_geometry(classified_df, points_geometry_col, crs_input)
+                    else:
+                        # Database data: use already processed geometry
+                        points_gdf = st.session_state.get('points_gdf')
                     
-                    # Load polygon GeoDataFrame from uploaded file
-                    if polygon_file.name.endswith('.geojson'):
-                        polygon_gdf = gpd.read_file(polygon_file)
-                    elif polygon_file.name.endswith('.shp'):
-                        # For shapefile, we need to handle the .shp file specifically
-                        polygon_gdf = gpd.read_file(polygon_file)
-                    elif polygon_file.name.endswith('.gpkg'):
-                        polygon_gdf = gpd.read_file(polygon_file)
+                    # Load polygon GeoDataFrame from uploaded file or database
+                    if uploaded_file is not None:
+                        # File upload: load from uploaded file
+                        if polygon_file is not None:
+                            if polygon_file.name.endswith('.geojson'):
+                                polygon_gdf = gpd.read_file(polygon_file)
+                            elif polygon_file.name.endswith('.shp'):
+                                polygon_gdf = gpd.read_file(polygon_file)
+                            elif polygon_file.name.endswith('.gpkg'):
+                                polygon_gdf = gpd.read_file(polygon_file)
+                            else:
+                                polygon_gdf = None
+                        else:
+                            polygon_gdf = None
+                    else:
+                        # Database data: use stored GeoDataFrame or load from temporary file
+                        polygon_gdf = st.session_state.get('polygon_gdf')
+                        if polygon_gdf is None:
+                            # Fallback to temporary file if GeoDataFrame not available
+                            current_polygon_file = st.session_state.get('polygon_file')
+                            if current_polygon_file is not None and hasattr(current_polygon_file, 'name'):
+                                polygon_gdf = gpd.read_file(current_polygon_file.name)
                     
                     if points_gdf is None or polygon_gdf is None:
                         st.error("❌ Failed to load geometry data")
@@ -3014,10 +3408,19 @@ def main():
                     st.error(f"❌ Error processing geometry data: {str(e)}")
                     st.info("Please ensure your points geometry column contains valid WKB/WKT data and your polygon file is a valid GeoJSON, Shapefile, or GeoPackage.")
             else:
-                if not points_geometry_col:
-                    st.info("ℹ️ Please select a points geometry column from your Excel file to enable kriging maps.")
-                if polygon_file is None:
-                    st.info("ℹ️ Please upload a polygon geometry file (GeoJSON, Shapefile, or GeoPackage) to enable kriging maps.")
+                if uploaded_file is not None:
+                    # File upload mode
+                    if not points_geometry_col:
+                        st.info("ℹ️ Please select a points geometry column from your Excel file to enable kriging maps.")
+                    if not polygon_file:
+                        st.info("ℹ️ Please upload a polygon geometry file (GeoJSON, Shapefile, or GeoPackage) to enable kriging maps.")
+                else:
+                    # Database mode
+                    if st.session_state.get('points_gdf') is None:
+                        st.info("ℹ️ Please process the database data with geometry columns to enable kriging maps.")
+                    if (st.session_state.get('polygon_file') is None and 
+                        st.session_state.get('polygon_gdf') is None):
+                        st.info("ℹ️ Please process the database data to load polygon boundaries for kriging maps.")
             
             # Report Generation
             st.subheader(t('pdf_report_generation'))
@@ -3086,64 +3489,64 @@ def main():
                                 st.error(f"{t('docx_error')} {str(e)}")
             
             with col3:
-                # Excel download with colors
-                output = io.BytesIO()
-                current_language = st.session_state.get('language', 'en')
+                    # Excel download with colors
+                    output = io.BytesIO()
+                    current_language = st.session_state.get('language', 'pt')
                     
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    # Prepare export dataframe
-                    export_df = classified_df.copy()
-                    export_df["Classificação"] = export_df["Classificação"].apply(translate_classification)
-                    
-                    # Translate to English if language is English
-                    if current_language == 'en':
-                        export_df = translate_column_names_to_english(export_df)
-                        main_sheet_name = 'Classified_Data'
-                        classification_col_name = 'Classification'
-                    else:
-                        main_sheet_name = 'Dados_Classificados'
-                        classification_col_name = 'Classificação'
-                    
-                    export_df.to_excel(writer, sheet_name=main_sheet_name, index=False)
-                    
-                    # Apply colors to the classification column
-                    apply_excel_colors(writer.book[main_sheet_name], classification_col_name)
-                    
-                    # Médias (Averages) sheet by plot_type
-                    create_medias_sheet(writer, classified_df, param_col, value_col, language=current_language)
-                    
-                    # Statistics per plot_type, sampling_plan_purpose, depth_range_bottom_m with classified means
-                    stats_df = create_comprehensive_statistics_with_classification(
-                        classified_df, 
-                        ['Tratamento', 'Data amostragem', 'profundidade inferior'], 
-                        param_col, 
-                        value_col,
-                        language=current_language
-                    )
-                    
-                    if stats_df is not None and not stats_df.empty:
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        # Prepare export dataframe
+                        export_df = classified_df.copy()
+                        export_df["Classificação"] = export_df["Classificação"].apply(translate_classification)
+                        
+                        # Translate to English if language is English
                         if current_language == 'en':
-                            stats_sheet_name = 'Detailed_Statistics'
-                            stats_classification_col = 'Mean_Classification'
+                            export_df = translate_column_names_to_english(export_df)
+                            main_sheet_name = 'Classified_Data'
+                            classification_col_name = 'Classification'
                         else:
-                            stats_sheet_name = 'Estatísticas_Detalhadas'
-                            stats_classification_col = 'Classificação_Média'
-                            
-                        stats_df.to_excel(writer, sheet_name=stats_sheet_name, index=False)
-                        # Apply colors to the classification column in statistics
-                        apply_excel_colors(writer.book[stats_sheet_name], stats_classification_col)
+                            main_sheet_name = 'Dados_Classificados'
+                            classification_col_name = 'Classificação'
+                        
+                        export_df.to_excel(writer, sheet_name=main_sheet_name, index=False)
+                        
+                        # Apply colors to the classification column
+                        apply_excel_colors(writer.book[main_sheet_name], classification_col_name)
+                        
+                        # Médias (Averages) sheet by plot_type
+                        create_medias_sheet(writer, classified_df, param_col, value_col, language=current_language)
+                        
+                        # Statistics per plot_type, sampling_plan_purpose, depth_range_bottom_m with classified means
+                        stats_df = create_comprehensive_statistics_with_classification(
+                            classified_df, 
+                            ['Tratamento', 'Data amostragem', 'profundidade inferior'], 
+                            param_col, 
+                            value_col,
+                            language=current_language
+                        )
+                        
+                        if stats_df is not None and not stats_df.empty:
+                            if current_language == 'en':
+                                stats_sheet_name = 'Detailed_Statistics'
+                                stats_classification_col = 'Mean_Classification'
+                            else:
+                                stats_sheet_name = 'Estatísticas_Detalhadas'
+                                stats_classification_col = 'Classificação_Média'
+                                
+                            stats_df.to_excel(writer, sheet_name=stats_sheet_name, index=False)
+                            # Apply colors to the classification column in statistics
+                            apply_excel_colors(writer.book[stats_sheet_name], stats_classification_col)
+                        
+                        # Create color legend sheet
+                        create_color_legend_sheet(writer.book, language=current_language)
                     
-                    # Create color legend sheet
-                    create_color_legend_sheet(writer.book, language=current_language)
-                
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label=t('download_excel'),
-                    data=excel_data,
-                    file_name=f"dados_classificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                    excel_data = output.getvalue()
+                    
+                    st.download_button(
+                        label=t('download_excel'),
+                        data=excel_data,
+                        file_name=f"dados_classificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
         
         except Exception as e:
             st.error(f"❌ Erro ao processar arquivo: {str(e)}")
