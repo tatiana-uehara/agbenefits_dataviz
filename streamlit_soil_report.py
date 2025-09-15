@@ -27,6 +27,10 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 import tempfile
 import os
+from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
 
 # Excel formatting imports
 from openpyxl.styles import PatternFill
@@ -106,6 +110,11 @@ TRANSLATIONS = {
         'pdf_generated': '✅ Relatório PDF gerado com sucesso!',
         'download_pdf': '📥 Download do Relatório PDF',
         'pdf_error': '❌ Erro ao gerar PDF:',
+        'generate_docx': '📝 Gerar Relatório DOCX',
+        'generating_docx': 'Gerando relatório DOCX...',
+        'docx_generated': '✅ Relatório DOCX gerado com sucesso!',
+        'download_docx': '📥 Download do Relatório DOCX',
+        'docx_error': '❌ Erro ao gerar DOCX:',
         'download_excel': '📊 Download Excel',
         'upload_instructions': '👆 Faça upload de um arquivo na barra lateral para começar',
         'instructions': '📋 Instruções de Uso:',
@@ -206,6 +215,11 @@ TRANSLATIONS = {
         'pdf_generated': '✅ PDF report generated successfully!',
         'download_pdf': '📥 Download PDF Report',
         'pdf_error': '❌ Error generating PDF:',
+        'generate_docx': '📝 Generate DOCX Report',
+        'generating_docx': 'Generating DOCX report...',
+        'docx_generated': '✅ DOCX report generated successfully!',
+        'download_docx': '📥 Download DOCX Report',
+        'docx_error': '❌ Error generating DOCX:',
         'download_excel': '📊 Download Excel',
         'upload_instructions': '👆 Upload a file in the sidebar to start',
         'instructions': '📋 Usage Instructions:',
@@ -956,6 +970,126 @@ def generate_pdf_report(df, summary_stats, charts_data, project_name="Soil Analy
         pass
     
     return pdf_content
+
+def generate_docx_report(df, summary_stats, charts_data, project_name="Soil Analysis", 
+                        points_gdf=None, polygon_gdf=None, classifier=None, 
+                        param_col=None, value_col=None, purpose_filter=None, depth_filter=None):
+    """Generate DOCX report with kriging maps"""
+    
+    # Create new Document
+    doc = Document()
+    
+    # Set document margins
+    sections = doc.sections
+    for section in sections:
+        section.top_margin = Inches(1)
+        section.bottom_margin = Inches(1)
+        section.left_margin = Inches(1)
+        section.right_margin = Inches(1)
+    
+    # Title
+    title = doc.add_heading(t('page_title'), 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Project info
+    doc.add_paragraph(f"Project: {project_name}")
+    doc.add_paragraph(f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    doc.add_paragraph()  # Empty line
+    
+    # Executive Summary section
+    doc.add_heading('Executive Summary', level=1)
+    
+    # Summary table
+    summary_table = doc.add_table(rows=1, cols=2)
+    summary_table.style = 'Table Grid'
+    summary_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    # Header row
+    hdr_cells = summary_table.rows[0].cells
+    hdr_cells[0].text = 'Metric'
+    hdr_cells[1].text = 'Value'
+    
+    # Add summary data
+    summary_data = [
+        ["Total Samples", f"{summary_stats['total_samples']:,}"],
+        ["Parameters Analyzed", f"{df['Parâmetro'].nunique() if 'Parâmetro' in df.columns else 'N/A'}"],
+    ]
+    
+    # Add classification breakdown
+    if 'classification_counts' in summary_stats:
+        for classification, count in summary_stats['classification_counts'].items():
+            percentage = summary_stats['classification_percentages'][classification]
+            translated_class = translate_classification(classification)
+            summary_data.append([f"{translated_class}", f"{count} ({percentage:.1f}%)"])
+    
+    # Add data rows
+    for metric, value in summary_data:
+        row_cells = summary_table.add_row().cells
+        row_cells[0].text = metric
+        row_cells[1].text = value
+    
+    doc.add_paragraph()  # Empty line
+    
+    # Add Kriging Maps section if geospatial data is available
+    if points_gdf is not None and polygon_gdf is not None and classifier is not None:
+        doc.add_heading('Kriging Maps', level=1)
+        doc.add_paragraph('Spatial interpolation maps showing the distribution of soil parameters across the field.')
+        doc.add_paragraph()  # Empty line
+        
+        # Generate kriging maps for all parameters
+        kriging_images, temp_files = generate_all_parameter_kriging_maps(
+            df, points_gdf, polygon_gdf, classifier, param_col, value_col,
+            purpose_filter, depth_filter
+        )
+        
+        # Add each kriging map to the DOCX
+        for i, kriging_data in enumerate(kriging_images):
+            try:
+                # Add parameter title
+                doc.add_heading(kriging_data['title'], level=2)
+                
+                # Add the image with appropriate sizing
+                from PIL import Image as PILImage
+                with PILImage.open(kriging_data['image_path']) as pil_img:
+                    img_width, img_height = pil_img.size
+                    aspect_ratio = img_width / img_height
+                
+                # Set maximum dimensions and maintain aspect ratio
+                max_width = 6.5  # inches
+                max_height = 5.0  # inches
+                
+                if aspect_ratio > 1:  # Landscape
+                    width = min(max_width, max_height * aspect_ratio)
+                    height = width / aspect_ratio
+                else:  # Portrait
+                    height = min(max_height, max_width / aspect_ratio)
+                    width = height * aspect_ratio
+                
+                # Add image to document
+                doc.add_picture(kriging_data['image_path'], width=Inches(width))
+                
+                # Add page break after each map for better readability
+                if i < len(kriging_images) - 1:
+                    doc.add_page_break()
+                    
+            except Exception as e:
+                print(f"Error adding kriging map to DOCX: {str(e)}")
+                continue
+    
+    # Save to BytesIO buffer
+    doc_buffer = io.BytesIO()
+    doc.save(doc_buffer)
+    doc_buffer.seek(0)
+    
+    # Clean up temporary image files
+    if 'temp_files' in locals():
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+    
+    return doc_buffer.getvalue()
 
 def get_parameter_translations():
     """Get parameter translations from English to Portuguese"""
@@ -2232,10 +2366,10 @@ def main():
                     st.error(f"❌ Error loading GeoJSON files: {str(e)}")
                     st.info("Please ensure your GeoJSON files are valid and contain the required geometry and attribute data.")
             
-            # PDF Generation
+            # Report Generation
             st.subheader(t('pdf_report_generation'))
             
-            col1, col2 = st.columns([1, 1])
+            col1, col2, col3 = st.columns([1, 1, 1])
             
             with col1:
                 if st.button(t('generate_pdf'), type="primary"):
@@ -2265,66 +2399,98 @@ def main():
                             
                         except Exception as e:
                             st.error(f"{t('pdf_error')} {str(e)}")
+            
+            with col2:
+                if st.button(t('generate_docx'), type="secondary"):
+                    with st.spinner(t('generating_docx')):
+                        try:
+                            # Pass geospatial data and other parameters for kriging maps
+                            docx_content = generate_docx_report(
+                                classified_df, 
+                                summary_stats, 
+                                None,  # charts_data placeholder
+                                st.session_state.get('project_name', t('default_project')),
+                                points_gdf=points_gdf if 'points_gdf' in locals() else None,
+                                polygon_gdf=polygon_gdf if 'polygon_gdf' in locals() else None,
+                                classifier=classifier,
+                                param_col=param_col if 'param_col' in locals() else None,
+                                value_col=value_col if 'value_col' in locals() else None,
+                                purpose_filter=purpose_filter if 'purpose_filter' in locals() else None,
+                                depth_filter=depth_filter if 'depth_filter' in locals() else None
+                            )
+                            
+                            # Create download button for DOCX
+                            st.download_button(
+                                label=t('download_docx'),
+                                data=docx_content,
+                                file_name=f"relatorio_solo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            )
+                            
+                            st.success(t('docx_generated'))
+                            
+                        except Exception as e:
+                            st.error(f"{t('docx_error')} {str(e)}")
+            
+            with col3:
+                # Excel download with colors
+                output = io.BytesIO()
+                current_language = st.session_state.get('language', 'pt')
                 
-                with col2:
-                    # Excel download with colors
-                    output = io.BytesIO()
-                    current_language = st.session_state.get('language', 'pt')
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Prepare export dataframe
+                    export_df = classified_df.copy()
+                    export_df["Classificação"] = export_df["Classificação"].apply(translate_classification)
                     
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        # Prepare export dataframe
-                        export_df = classified_df.copy()
-                        export_df["Classificação"] = export_df["Classificação"].apply(translate_classification)
-                        
-                        # Translate to English if language is English
-                        if current_language == 'en':
-                            export_df = translate_column_names_to_english(export_df)
-                            main_sheet_name = 'Classified_Data'
-                            classification_col_name = 'Classification'
-                        else:
-                            main_sheet_name = 'Dados_Classificados'
-                            classification_col_name = 'Classificação'
-                        
-                        export_df.to_excel(writer, sheet_name=main_sheet_name, index=False)
-                        
-                        # Apply colors to the classification column
-                        apply_excel_colors(writer.book[main_sheet_name], classification_col_name)
-                        
-                        # Médias (Averages) sheet by plot_type
-                        create_medias_sheet(writer, classified_df, param_col, value_col, language=current_language)
-                        
-                        # Statistics per plot_type, sampling_plan_purpose, depth_range_bottom_m with classified means
-                        stats_df = create_comprehensive_statistics_with_classification(
-                            classified_df, 
-                            ['Tratamento', 'Data amostragem', 'profundidade inferior'], 
-                            param_col, 
-                            value_col,
-                            language=current_language
-                        )
-                        
-                        if stats_df is not None and not stats_df.empty:
-                            if current_language == 'en':
-                                stats_sheet_name = 'Detailed_Statistics'
-                                stats_classification_col = 'Mean_Classification'
-                            else:
-                                stats_sheet_name = 'Estatísticas_Detalhadas'
-                                stats_classification_col = 'Classificação_Média'
-                                
-                            stats_df.to_excel(writer, sheet_name=stats_sheet_name, index=False)
-                            # Apply colors to the classification column in statistics
-                            apply_excel_colors(writer.book[stats_sheet_name], stats_classification_col)
-                        
-                        # Create color legend sheet
-                        create_color_legend_sheet(writer.book, language=current_language)
+                    # Translate to English if language is English
+                    if current_language == 'en':
+                        export_df = translate_column_names_to_english(export_df)
+                        main_sheet_name = 'Classified_Data'
+                        classification_col_name = 'Classification'
+                    else:
+                        main_sheet_name = 'Dados_Classificados'
+                        classification_col_name = 'Classificação'
                     
-                    excel_data = output.getvalue()
+                    export_df.to_excel(writer, sheet_name=main_sheet_name, index=False)
                     
-                    st.download_button(
-                        label=t('download_excel'),
-                        data=excel_data,
-                        file_name=f"dados_classificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    # Apply colors to the classification column
+                    apply_excel_colors(writer.book[main_sheet_name], classification_col_name)
+                    
+                    # Médias (Averages) sheet by plot_type
+                    create_medias_sheet(writer, classified_df, param_col, value_col, language=current_language)
+                    
+                    # Statistics per plot_type, sampling_plan_purpose, depth_range_bottom_m with classified means
+                    stats_df = create_comprehensive_statistics_with_classification(
+                        classified_df, 
+                        ['Tratamento', 'Data amostragem', 'profundidade inferior'], 
+                        param_col, 
+                        value_col,
+                        language=current_language
                     )
+                    
+                    if stats_df is not None and not stats_df.empty:
+                        if current_language == 'en':
+                            stats_sheet_name = 'Detailed_Statistics'
+                            stats_classification_col = 'Mean_Classification'
+                        else:
+                            stats_sheet_name = 'Estatísticas_Detalhadas'
+                            stats_classification_col = 'Classificação_Média'
+                            
+                        stats_df.to_excel(writer, sheet_name=stats_sheet_name, index=False)
+                        # Apply colors to the classification column in statistics
+                        apply_excel_colors(writer.book[stats_sheet_name], stats_classification_col)
+                    
+                    # Create color legend sheet
+                    create_color_legend_sheet(writer.book, language=current_language)
+                
+                excel_data = output.getvalue()
+                
+                st.download_button(
+                    label=t('download_excel'),
+                    data=excel_data,
+                    file_name=f"dados_classificados_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
         
         except Exception as e:
             st.error(f"❌ Erro ao processar arquivo: {str(e)}")
